@@ -1,0 +1,16 @@
+[Unit]
+Description=Sophos XGS NPU front ports (reset release + xgsnpu driver)
+DefaultDependencies=no
+After=systemd-udevd.service systemd-modules-load.service local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/xgsnpu-up
+ExecStop=/usr/sbin/rmmod xgsnpu
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
