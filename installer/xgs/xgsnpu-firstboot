@@ -1,0 +1,20 @@
+#!/bin/sh
+# First boot after an automated install: the installer had no network (the front ports
+# need xgsnpu), so finish here - apt sources, DKMS build for this and future kernels.
+exec >>/var/log/xgsnpu-firstboot.log 2>&1
+echo "=== $(date) firstboot"
+i=0; until ping -c1 -W2 deb.debian.org >/dev/null 2>&1; do
+	i=$((i+1)); [ $i -ge 60 ] && { echo "no network after 5 min - will retry next boot"; exit 1; }
+	sleep 5
+done
+export DEBIAN_FRONTEND=noninteractive
+apt-get update && apt-get install -y dkms linux-headers-amd64 build-essential ethtool psmisc iperf3 tcpdump || exit 1
+dkms add xgsnpu/0.1 || true
+for k in /lib/modules/*; do
+	k=${k##*/}; [ -d /lib/modules/$k/build ] || continue
+	dkms install xgsnpu/0.1 -k $k || exit 1
+done
+rm -f /lib/modules/*/extra/xgsnpu.ko
+for k in /lib/modules/*; do depmod -a ${k##*/}; done
+touch /var/lib/xgsnpu-firstboot.done
+echo "firstboot complete"

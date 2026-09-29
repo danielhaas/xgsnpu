@@ -1,0 +1,13 @@
+[Unit]
+Description=XGS first boot: apt setup and DKMS build of xgsnpu
+After=xgsnpu.service network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/xgsnpu-firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xgsnpu-firstboot
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
