@@ -13,8 +13,8 @@ dkms add xgsnpu/0.1 || true
 for k in /lib/modules/*; do
 	k=${k##*/}; [ -d /lib/modules/$k/build ] || continue
 	dkms install xgsnpu/0.1 -k $k || exit 1
+	rm -f /lib/modules/$k/extra/xgsnpu.ko	# only where DKMS replaced the prebuilt one
 done
-rm -f /lib/modules/*/extra/xgsnpu.ko
 for k in /lib/modules/*; do depmod -a ${k##*/}; done
 touch /var/lib/xgsnpu-firstboot.done
 echo "firstboot complete"
