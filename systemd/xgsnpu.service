@@ -9,7 +9,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/xgsnpu-up
-ExecStop=/usr/sbin/rmmod xgsnpu
+ExecStop=/usr/local/sbin/xgsnpu-up stop
 TimeoutStartSec=180
 
 [Install]

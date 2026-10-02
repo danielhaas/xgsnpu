@@ -41,6 +41,10 @@ static unsigned int stages = 0xf;
 module_param(stages, uint, 0444);
 MODULE_PARM_DESC(stages, "bring-up stages: 1=handshake 2=giu datapath 4=netagent 8=rpc tables");
 
+static char *mac_src = "factory";
+module_param(mac_src, charp, 0444);
+MODULE_PARM_DESC(mac_src, "port MAC addresses: factory (Sophos-assigned, read from the NPU) or derived (02:<crc32 of DMI serial>:00:<port>)");
+
 static unsigned int poll_us = 100;
 module_param(poll_us, uint, 0644);
 MODULE_PARM_DESC(poll_us, "datapath poll interval when idle, microseconds");
@@ -326,6 +330,8 @@ struct xgs_port {
 };
 
 struct nwa_port {
+	u8 factory[ETH_ALEN];	/* what NetAgent reported before we set ours */
+	bool have_factory;
 	int up;
 	int link;
 	int media;
@@ -396,6 +402,8 @@ struct xgs {
 	struct mutex nwa_mutex;
 	struct delayed_work nwa_work;
 	bool nwa_ready;
+	bool nwa_mailbox;		/* mailbox found and validated */
+	bool use_factory;
 	int nwa_tries;
 	int nwa_sweep;
 	u32 nwa_body;
@@ -1427,8 +1435,12 @@ static int giu_register_netdevs(struct xgs *sc)
 		pt->fp = fp;
 		pt->idx = i;
 		pt->link = -1;
-		memcpy(pt->mac, sc->hostmac, ETH_ALEN);
-		pt->mac[5] = sc->hostmac[5] + fp->unit;
+		if (sc->use_factory && sc->nport[i].have_factory) {
+			memcpy(pt->mac, sc->nport[i].factory, ETH_ALEN);
+		} else {
+			memcpy(pt->mac, sc->hostmac, ETH_ALEN);
+			pt->mac[5] = sc->hostmac[5] + fp->unit;
+		}
 		eth_hw_addr_set(ndev, pt->mac);
 		ndev->netdev_ops = &xgs_netdev_ops;
 		ndev->ethtool_ops = &xgs_ethtool_ops;
@@ -1444,6 +1456,9 @@ static int giu_register_netdevs(struct xgs *sc)
 			free_netdev(ndev);
 			return err;
 		}
+		/* after registration, which copies dev_addr into perm_addr */
+		if (sc->nport[i].have_factory)
+			memcpy(ndev->perm_addr, sc->nport[i].factory, ETH_ALEN);
 		spin_lock_bh(&sc->lock);
 		sc->port[i] = pt;
 		if (fp->tag & 0x8000)
@@ -1666,17 +1681,7 @@ static int giu_attach(struct xgs *sc)
 			put_unaligned_le64(AGNIC_COOKIE_DRIVER_WATERMARK,
 					   desc_at(&sc->rx[q], i) + AGNIC_RXD_COOKIE);
 
-	err = giu_bringup(sc);
-	if (err)
-		return err;
-
-	err = giu_register_netdevs(sc);
-	if (err)
-		return err;
-
-	dev_info(sc->dev, "giu: datapath enabled - %d interfaces, %d descriptors each way\n",
-		 NFRONT, GIU_DATA_Q_LEN);
-	return 0;
+	return giu_bringup(sc);
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -1798,6 +1803,26 @@ static int nwa_set_mac(struct xgs *sc, int n)
 	return nwa_command(sc, NWA_OP_SET, NWA_SUB_MAC, front_ports[n].tag, pl, 2, NULL, 0);
 }
 
+/*
+ * Read the port's address from NetAgent before this driver sets its own: on a freshly reset
+ * NPU that is the address Sophos assigned the port. Read before the netdevs are created, so
+ * they can be registered with it (mac_src=factory) and always report it via ethtool -P.
+ */
+static void nwa_read_factory_mac(struct xgs *sc, int n)
+{
+	struct nwa_port *p = &sc->nport[n];
+	u32 z = 0, r[2] = { 0, 0 };
+	u8 *m = p->factory;
+
+	if (nwa_command(sc, NWA_OP_GET, NWA_SUB_MAC, front_ports[n].tag, &z, 1, r, 2))
+		return;
+	m[0] = r[0]; m[1] = r[0] >> 8; m[2] = r[0] >> 16; m[3] = r[0] >> 24;
+	m[4] = r[1]; m[5] = r[1] >> 8;
+	if (!is_valid_ether_addr(m))
+		return;
+	p->have_factory = true;
+}
+
 static void nwa_bring_up(struct xgs *sc)
 {
 	int n, up = 0, addressed = 0;
@@ -1874,57 +1899,64 @@ static void nwa_link_step(struct xgs *sc)
 	sc->nwa_sweep = (n + 1) % NFRONT;
 }
 
-static void nwa_work_fn(struct work_struct *w)
+/*
+ * Wait for NetAgent to publish its mailbox (about ten seconds after the handshake) and
+ * validate it. nwa_mutex held. Returns 0 when the mailbox is usable.
+ */
+static int nwa_wait_mailbox(struct xgs *sc)
 {
-	struct xgs *sc = container_of(to_delayed_work(w), struct xgs, nwa_work);
-	unsigned long delay = msecs_to_jiffies(NWA_LINK_TICK_MS);
-	u32 cookie, body, maxreq;
+	u32 cookie = 0, body, maxreq;
 
-	if (READ_ONCE(sc->stopping))
-		return;
-	mutex_lock(&sc->nwa_mutex);
-	if (sc->nwa_ready) {
-		nwa_link_step(sc);
-		goto out;
-	}
-
-	cookie = nwa_rd(sc, NWA_COOKIE);
-	if (cookie != NWA_COOKIE_VALUE) {
-		if (++sc->nwa_tries >= NWA_READY_TRIES) {
-			dev_err(sc->dev, "nwa: the network agent never appeared (cookie %#x) - ports stay down\n",
-				cookie);
-			mutex_unlock(&sc->nwa_mutex);
-			return;
-		}
-		if (sc->nwa_tries == 1)
+	for (sc->nwa_tries = 0; sc->nwa_tries < NWA_READY_TRIES; sc->nwa_tries++) {
+		cookie = nwa_rd(sc, NWA_COOKIE);
+		if (cookie == NWA_COOKIE_VALUE)
+			break;
+		if (sc->nwa_tries == 0)
 			dev_info(sc->dev, "nwa: waiting for the network agent to publish its window\n");
-		delay = msecs_to_jiffies(500);
-		goto out;
+		if (!xgs_sleep(sc, 500))
+			return -EINTR;
+	}
+	if (cookie != NWA_COOKIE_VALUE) {
+		dev_err(sc->dev, "nwa: the network agent never appeared (cookie %#x) - ports stay down\n",
+			cookie);
+		return -ETIMEDOUT;
 	}
 	body = nwa_rd(sc, NWA_BODY_OFF);
 	if (body != NWA_BODY_EXPECTED) {
 		dev_err(sc->dev, "nwa: mailbox body offset %#x, this driver speaks %#x - refusing\n",
 			body, NWA_BODY_EXPECTED);
-		mutex_unlock(&sc->nwa_mutex);
-		return;
+		return -EPROTO;
 	}
 	maxreq = nwa_rd(sc, NWA_MAX_REQ);
 	if (maxreq < NWA_REQ_SIZE || maxreq > sc->nwa_size) {
 		dev_err(sc->dev, "nwa: maximum request %u does not fit the window - refusing\n", maxreq);
-		mutex_unlock(&sc->nwa_mutex);
-		return;
+		return -EPROTO;
 	}
 	sc->nwa_body = body;
 	sc->nwa_max_req = maxreq;
 	dev_info(sc->dev, "nwa: mailbox ready after %d ms, requests up to %u bytes\n",
 		 sc->nwa_tries * 500, maxreq);
-	nwa_bring_up(sc);
-	sc->nwa_ready = true;
-	sc->nwa_sweep = 0;
-out:
+	return 0;
+}
+
+/* runs only once the mailbox is known: bring the ports up, then poll link state */
+static void nwa_work_fn(struct work_struct *w)
+{
+	struct xgs *sc = container_of(to_delayed_work(w), struct xgs, nwa_work);
+
+	if (READ_ONCE(sc->stopping))
+		return;
+	mutex_lock(&sc->nwa_mutex);
+	if (!sc->nwa_ready) {
+		nwa_bring_up(sc);
+		sc->nwa_ready = true;
+		sc->nwa_sweep = 0;
+	} else {
+		nwa_link_step(sc);
+	}
 	mutex_unlock(&sc->nwa_mutex);
 	if (!READ_ONCE(sc->stopping))
-		queue_delayed_work(sc->wq, &sc->nwa_work, delay);
+		queue_delayed_work(sc->wq, &sc->nwa_work, msecs_to_jiffies(NWA_LINK_TICK_MS));
 }
 
 static void nwa_teardown(struct xgs *sc)
@@ -2238,8 +2270,36 @@ static void xgs_bringup(struct work_struct *w)
 		return;
 	}
 
-	if ((stages & 4) && sc->nwa_size)
-		queue_delayed_work(sc->wq, &sc->nwa_work, msecs_to_jiffies(500));
+	/* the factory addresses come from NetAgent, so it has to be up before the netdevs exist */
+	sc->use_factory = !strcmp(mac_src, "factory");
+	if ((stages & 4) && sc->nwa_size) {
+		int n, got = 0;
+
+		mutex_lock(&sc->nwa_mutex);
+		sc->nwa_mailbox = !nwa_wait_mailbox(sc);
+		if (sc->nwa_mailbox)
+			for (n = 0; n < NFRONT; n++) {
+				nwa_read_factory_mac(sc, n);
+				got += sc->nport[n].have_factory;
+			}
+		mutex_unlock(&sc->nwa_mutex);
+		if (sc->nwa_mailbox)
+			dev_info(sc->dev, "nwa: %d of %d factory MACs read (first %pM)\n", got, NFRONT,
+				 sc->nport[0].factory);
+	}
+	if (sc->use_factory)
+		dev_info(sc->dev, "ports use their factory MACs where the NPU reported one\n");
+
+	err = giu_register_netdevs(sc);
+	if (err) {
+		dev_err(sc->dev, "giu: could not register the port interfaces (%d)\n", err);
+		return;
+	}
+	dev_info(sc->dev, "giu: datapath enabled - %d interfaces, %d descriptors each way\n",
+		 NFRONT, GIU_DATA_Q_LEN);
+
+	if (sc->nwa_mailbox)
+		queue_delayed_work(sc->wq, &sc->nwa_work, 0);
 	if ((stages & 8) && sc->rpc_size) {
 		sc->rpc_cmd = dma_alloc_coherent(sc->dev, RPC_DATA_MAX_SIZE, &sc->rpc_cmd_pa, GFP_KERNEL);
 		if (sc->rpc_cmd)

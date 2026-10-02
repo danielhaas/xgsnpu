@@ -7,10 +7,21 @@ LOG=/var/log/xgsnpu-npu-console.log
 PIDF=/run/xgsnpu-console.pid
 MCP=/usr/local/lib/xgsnpu/mcp2210.py
 
+if [ "$1" = stop ]; then
+	for i in $(ifquery --state 2>/dev/null | sed -n 's/=.*//p' | grep '^port'); do ifdown --force "$i" 2>/dev/null; done
+	lsmod | grep -q '^xgsnpu' && rmmod xgsnpu
+	exit 0
+fi
+
 [ "$(cat $DEV/vendor 2>/dev/null)" = "0x11ab" ] || { echo "xgsnpu: no NPU endpoint at 01:00.0"; exit 0; }
 [ -c /dev/hidraw0 ] || { echo "xgsnpu: no MCP2210 bridge (/dev/hidraw0)"; exit 0; }
 
-lsmod | grep -q '^xgsnpu' && rmmod xgsnpu
+# take the ports down in ifupdown first, or it keeps them "already configured" and
+# hotplug will not bring them back up after the reload
+if lsmod | grep -q '^xgsnpu'; then
+	for i in $(ifquery --state 2>/dev/null | sed -n 's/=.*//p' | grep '^port'); do ifdown --force "$i" 2>/dev/null; done
+	rmmod xgsnpu
+fi
 [ -f $PIDF ] && kill "$(cat $PIDF)" 2>/dev/null; rm -f $PIDF
 
 # NPU console, echo OFF (echo derails its U-Boot), hard timeout
@@ -27,7 +38,7 @@ done
 [ $i -ge 90 ] && echo "xgsnpu: NPU console never reported the handshake wait - trying anyway"
 echo "xgsnpu: NPU up after ${i}s, restoring BARs"
 echo 1 > $DEV/remove; sleep 1; echo 1 > /sys/bus/pci/rescan; sleep 2
-modprobe xgsnpu "$@"
+modprobe xgsnpu
 # give the driver time to create the netdevs so ifupdown's hotplug sees them
 i=0; while [ $i -lt 60 ] && [ ! -e /sys/class/net/port1 ]; do sleep 1; i=$((i+1)); done
 [ -e /sys/class/net/port1 ] && echo "xgsnpu: front ports registered" || echo "xgsnpu: ports did not appear - see dmesg"
